@@ -1,0 +1,187 @@
+name: Ariawalk accessibility tests
+description: Run Ariawalk tests on the runner (localhost, previews, staging behind a VPN) and fail the job on accessibility problems.
+author: Ariawalk
+branding:
+  icon: eye
+  color: green
+
+inputs:
+  api-key:
+    description: An Ariawalk API key with "Read and run" access (Settings → API and MCP). Store it as a secret.
+    required: true
+  tests:
+    description: Test ids to run, separated by spaces or new lines.
+    required: false
+  app:
+    description: Or run every test of this application (name or id).
+    required: false
+  base-url:
+    description: Run the tests on this origin, keeping each test's path, e.g. http://localhost:3000 or a preview URL.
+    required: false
+  fail-on:
+    description: What fails the job, comma-separated - blocked (default), regression, new-serious, none.
+    required: false
+    default: blocked
+  min-score:
+    description: Also fail tests whose overall score (0-100) is lower.
+    required: false
+  concurrency:
+    description: Tests run at once, each in its own browser (1-10).
+    required: false
+    default: '1'
+  data:
+    description: |
+      Test data values, one KEY=value per line, e.g. secrets Ariawalk never sends:
+        password=${{ secrets.STAGING_PASSWORD }}
+    required: false
+  junit:
+    description: Write JUnit XML results to this path.
+    required: false
+  version:
+    description: The ariawalk CLI version to use (an npm version or range).
+    required: false
+    default: latest
+  comment:
+    description: On pull requests, keep one comment with the results up to date (needs pull-requests write permission).
+    required: false
+    default: 'true'
+  comment-key:
+    description: Tells this step's comment apart when several jobs comment on the same pull request.
+    required: false
+    default: ${{ github.job }}
+  github-token:
+    description: Token for the pull request comment.
+    required: false
+    default: ${{ github.token }}
+  api-url:
+    description: Another Ariawalk instance than https://ariawalk.com.
+    required: false
+
+outputs:
+  exit-code:
+    description: 0 every test passed, 1 an accessibility check failed, 2 a run could not finish.
+    value: ${{ steps.run.outputs.exit-code }}
+  summary:
+    description: Path of the Markdown summary.
+    value: ${{ steps.run.outputs.summary }}
+  results:
+    description: Path of the results as JSON.
+    value: ${{ steps.run.outputs.results }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the CLI version
+      id: cli
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (a<20||(a===20&&b<3)) { console.error("::error::ariawalk needs Node.js 20.3 or later (actions/setup-node)."); process.exit(1) }'
+        resolved=$(npm view "ariawalk@${VERSION}" version | tail -n 1 | tr -d "'" | awk '{print $NF}')
+        if [ -z "$resolved" ]; then echo "::error::No ariawalk version matches \"${VERSION}\"."; exit 1; fi
+        echo "version=${resolved}" >> "$GITHUB_OUTPUT"
+        echo "Using ariawalk ${resolved}"
+
+    - name: Cache Chromium
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cache/ms-playwright
+          ~/Library/Caches/ms-playwright
+          ~\AppData\Local\ms-playwright
+        key: ariawalk-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.cli.outputs.version }}
+
+    - name: Install Chromium
+      shell: bash
+      env:
+        CLI: ariawalk@${{ steps.cli.outputs.version }}
+      run: |
+        # Linux runners also need Chromium's system libraries (they aren't cached).
+        npx --yes "$CLI" install $([ "$RUNNER_OS" = "Linux" ] && echo --with-deps)
+
+    - name: Run the tests
+      id: run
+      shell: bash
+      env:
+        CLI: ariawalk@${{ steps.cli.outputs.version }}
+        ARIAWALK_API_KEY: ${{ inputs.api-key }}
+        INPUT_TESTS: ${{ inputs.tests }}
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_BASE_URL: ${{ inputs.base-url }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_MIN_SCORE: ${{ inputs.min-score }}
+        INPUT_CONCURRENCY: ${{ inputs.concurrency }}
+        INPUT_DATA: ${{ inputs.data }}
+        INPUT_JUNIT: ${{ inputs.junit }}
+        INPUT_API_URL: ${{ inputs.api-url }}
+      run: |
+        args=(run)
+        read -r -a tests <<< "$(echo "$INPUT_TESTS" | tr '\n' ' ')"
+        args+=("${tests[@]}")
+        [ -n "$INPUT_APP" ] && args+=(--app "$INPUT_APP")
+        if [ ${#tests[@]} -eq 0 ] && [ -z "$INPUT_APP" ]; then
+          echo "::error::Set tests (test ids) or app (an application name or id)."
+          exit 2
+        fi
+        [ -n "$INPUT_BASE_URL" ] && args+=(--base-url "$INPUT_BASE_URL")
+        [ -n "$INPUT_FAIL_ON" ] && args+=(--fail-on "$INPUT_FAIL_ON")
+        [ -n "$INPUT_MIN_SCORE" ] && args+=(--min-score "$INPUT_MIN_SCORE")
+        [ -n "$INPUT_CONCURRENCY" ] && args+=(--concurrency "$INPUT_CONCURRENCY")
+        [ -n "$INPUT_JUNIT" ] && args+=(--junit "$INPUT_JUNIT")
+        [ -n "$INPUT_API_URL" ] && args+=(--api-url "$INPUT_API_URL")
+
+        # Test data as environment variables (ARIAWALK_DATA_<KEY>), never as arguments.
+        while IFS= read -r line; do
+          [ -z "${line// }" ] && continue
+          key="${line%%=*}"; value="${line#*=}"
+          if [ "$key" = "$line" ]; then echo "::error::data lines look like KEY=value."; exit 2; fi
+          name="ARIAWALK_DATA_$(echo "$key" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g')"
+          echo "::add-mask::$value"
+          export "$name=$value"
+        done <<< "$INPUT_DATA"
+
+        summary="$RUNNER_TEMP/ariawalk-summary.md"
+        results="$RUNNER_TEMP/ariawalk-results.json"
+        set +e
+        npx --yes "$CLI" "${args[@]}" --markdown "$summary" --json-file "$results"
+        code=$?
+        set -e
+        {
+          echo "exit-code=$code"
+          echo "summary=$summary"
+          echo "results=$results"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Comment on the pull request
+      if: always() && inputs.comment == 'true' && github.event.pull_request.number && steps.run.outputs.summary != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ github.event.pull_request.number }}
+        SUMMARY: ${{ steps.run.outputs.summary }}
+        MARKER: '<!-- ariawalk-action:${{ inputs.comment-key }} -->'
+      run: |
+        [ -s "$SUMMARY" ] || exit 0
+        body="$(printf '%s\n%s' "$MARKER" "$(cat "$SUMMARY")")"
+        existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+          --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" 2>/dev/null | head -n 1) || true
+        if [ -n "$existing" ]; then
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$body" >/dev/null \
+            || echo "::warning::Couldn't update the Ariawalk comment. Give the job 'pull-requests: write' permission."
+        else
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$body" >/dev/null \
+            || echo "::warning::Couldn't comment on the pull request. Give the job 'pull-requests: write' permission."
+        fi
+
+    - name: Result
+      if: always() && steps.run.outputs.exit-code != ''
+      shell: bash
+      env:
+        CODE: ${{ steps.run.outputs.exit-code }}
+      run: |
+        case "$CODE" in
+          0) echo "Every Ariawalk test passed." ;;
+          1) echo "::error::An accessibility check failed. See the summary and the reports."; exit 1 ;;
+          *) echo "::error::A run couldn't finish (setup, quota, login or network); this isn't an accessibility failure."; exit "$CODE" ;;
+        esac

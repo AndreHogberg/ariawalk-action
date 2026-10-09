@@ -1,0 +1,69 @@
+name: Test
+
+# Exercises the action without an Ariawalk account: install, cache, a run that
+# fails to log in (exit code 2, not an accessibility failure) and the outputs.
+# With an ARIAWALK_API_KEY secret, "Run workflow" can also run a real test.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      test:
+        description: A test id to run for real (needs the ARIAWALK_API_KEY secret)
+        required: false
+      base-url:
+        description: Base URL for that test
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: A run with a key that doesn't work
+        id: bad-key
+        uses: ./
+        continue-on-error: true
+        with:
+          api-key: aw_00000000000000000000000000000000000000000000
+          tests: 00000000-0000-0000-0000-000000000000
+          data: |
+            password=not-a-real-secret
+          comment: 'false'
+
+      - name: It failed as a run, not as an accessibility check
+        shell: bash
+        run: |
+          test "${{ steps.bad-key.outcome }}" = "failure"
+          test "${{ steps.bad-key.outputs.exit-code }}" = "2"
+
+      - name: Nothing to run
+        id: no-tests
+        uses: ./
+        continue-on-error: true
+        with:
+          api-key: aw_00000000000000000000000000000000000000000000
+          comment: 'false'
+
+      - name: It said what's missing
+        shell: bash
+        run: test "${{ steps.no-tests.outcome }}" = "failure"
+
+  real:
+    if: github.event_name == 'workflow_dispatch' && inputs.test != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        with:
+          api-key: ${{ secrets.ARIAWALK_API_KEY }}
+          tests: ${{ inputs.test }}
+          base-url: ${{ inputs.base-url }}
+          comment: 'false'
