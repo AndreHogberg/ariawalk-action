@@ -30,9 +30,7 @@ inputs:
     required: false
     default: '1'
   data:
-    description: |
-      Test data values, one KEY=value per line, e.g. secrets Ariawalk never sends:
-        password=${{ secrets.STAGING_PASSWORD }}
+    description: Test data values, one KEY=value per line, e.g. a password from a secret (Ariawalk never sends secret values). Masked in logs.
     required: false
   junit:
     description: Write JUnit XML results to this path.
